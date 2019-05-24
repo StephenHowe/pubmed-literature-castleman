@@ -1,0 +1,952 @@
+---
+title: "Engineering Knowledge from the Published Medical Literature"
+output: 
+  html_notebook:
+   code_folding: hide
+---
+
+####Stephen Howe
+#####30 March 2019
+#####Northeastern University College of Professional Studies
+#####ALY6980 Winter 2019
+
+
+#Introduction
+
+"Literature-based Discovery (LBD) seeks to discover new knowledge from existing literature in an automated or semi-automated way. Scientific literature is growing at an exponential rate causing researchers to become increasingly specialized, and making it difficult for researchers to stay current in even their narrow discipline. There is too much information for anyone to read, much less understand" (Henry & McInnes, 2017).
+
+The analysis presented in this R Notebook is directed at the scientific researcher looking to gain new insights from a set of scientific literature. In this notebook, I apply various text-analysis, text-mining, and natural language processing techniques to a set of data describing a small set of published scientific articles on Castleman Disease. The goal here is to demonstrate the kinds of information and insights that can be extracted from published works metadata. The objective here is one of efficiency. For a publishing industry that is still built around single-threaded, human-readable documents, and for the scientific researcher aiming to distill learnings from the published body of liteature so that they can move on to their own, core research, the benefit of (semi-)automated knowledge discovery is huge.
+
+The analysis below is question-driven and provides both the answers to these questions and the code used to derive those answers. For a more thorough discussion and presentation of the industry context, problem space, problem statements, and hypotheses behind this analysis, please refer to the accompanying presentation, *Engineering Knowledge from the Published Medical Literature: Applying Natural Language Processing Methods to a Corpus of Castleman Disease Articles.*
+
+#The Data
+
+Data for this analysis has been sourced from the MEDLINE/Pubmed repository of published articles in the bioscience domain. Pubmed was created and is maintained by the National Library of Medicine. The complete dataset of 29 million articles can be downloaded for free directly from the [library](https://www.nlm.nih.gov/databases/download/pubmed_medline.html). For this analysis, the set of articles is limited to those specifically on Castleman Disease. This set of articles was obtained by searching on the [Pubmed search page](https://www.ncbi.nlm.nih.gov/pubmed/) using the search query `"Castleman Disease" [MeSH Terms]`. This search query relies on MEDLINE's authoritative ontology of medical subject headings (MeSH) to isolate the relevant articles. This query returns a set of 2417 articles (as of March 11, 2019) that was then downloaded as an XML file. A description of the MEDLINE XML DTD and each XML element can be found on the [MEDLINE/Pubmed XML Data Elements](https://www.nlm.nih.gov/bsd/licensee/data_elements_doc.html) webpage.
+
+#R Packages and Data
+
+The libraries required for this analysis are loaded next and the XML file is parsed into a variable. I also create a list of the PMIDs used to identify each article in this XML file. PMID is MEDLINE's standard identifier for a published article. It is unique.
+```{r libraries_data, message=FALSE, warning=FALSE}
+#libraries ----
+Sys.time()
+
+library(XML) #xml parsing
+library(xml2) #xml parsing
+library(dplyr) #data manipulation and cleaning
+library(plyr) #data maniupulation and cleaning
+library(ggplot2) #data visualization
+library(rworldmap) #world map visulization
+library(tm) #text mining
+library(topicmodels) #LDA topic modeling
+library(networkD3) #network graphs
+library(igraph) #network graphs
+library(viridis) #color
+library(textmineR) #text mining: LDA, LSA, Hierarchical Clustering, Summarization
+library(factoextra) #multivariate data analysis
+library(NbClust) #finds optimal cluster number
+library(purrr) #functional programming tools
+library(tidyr) #data munging
+library(tidyverse) #text mining
+library(clValid) #Dunn's Index
+library(rcrossref) #CrossRef API
+library(rjson) #parsing JSON
+library(e1071) #for NaiveBayes
+library(gmodels) #for CrossTable
+library(ldatuning) #optimal number of topics
+library(tidytext) #text clean-up
+library(beepr) #sound generator
+
+#initial data ----
+#load and parse Pubmed .xml for Castleman's Disease
+castleman <- xmlParse("castleman20190311.xml")
+castleman2 <- read_xml("castleman20190311.xml") #alternative method for reading xml; used to support different libraries
+
+#create a list of main article PMIDs
+pmid_list <- as.numeric(xpathSApply(castleman, "//PubmedArticle/MedlineCitation/PMID", xmlValue))
+
+```
+
+#Overview of Literature
+
+To begin, let us get an overview of the set of articles we have on Castleman Disease. There are `r length(pmid_list)` articles in this set of publications downloaded from MEDLINE/Pubmed. We can determine the following information about this set of articles.
+
+##Count of Publications by Publishing Date
+```{r pubdate}
+
+#get all pubdates
+pubdate_all <- as.data.frame(xpathSApply(castleman, "//PubDate", xmlValue), stringsAsFactors = FALSE)
+colnames(pubdate_all) <- "pubdate"
+pubdate_all$pubdate <- substring(pubdate_all$pubdate, 1, 4) #extract year
+pubdate_all <- subset(pubdate_all, !(pubdate_all$pubdate == "Wint")) #remove non-numerical year
+pubdate_all$pubdate <- as.Date(pubdate_all$pubdate, format = "%Y")
+
+```
+
+_**When has the research on Castleman disease occured?**_
+
+There are `r length(pmid_list)` articles in this set ranging from `r min(pubdate_all$pubdate)` to `r max(pubdate_all$pubdate)`. The majority of articles have been publsihed this century with a median publication year of `r substring(median(pubdate_all$pubdate),1,4)`.
+
+```{r pubdate_plot}
+#plot it
+pubyear <- group_by(pubdate_all, pubdate)
+pubyear.s <- dplyr::summarise(pubyear, count = n())
+
+p1 <- ggplot(data=pubyear.s, aes(x=pubdate, y=count)) +
+  geom_bar(stat="identity", fill="dark red") + 
+  labs(title="Number of Publications by Year", x="Publication Year", y="Number of Publications")
+
+p1
+boxplot(pubdate_all$pubdate, main="Boxplot of publication years", xlab = "Distribution of Publication Year", ylab="Publication Year")
+```
+
+##Journals Publishing on Castleman Disease
+
+```{r journals, message=FALSE, warning=FALSE}
+#get all journal titles
+journals <- as.data.frame(xpathSApply(castleman,                                      "//PubmedArticle/MedlineCitation/MedlineJournalInfo/MedlineTA",xmlValue), stringsAsFactors = FALSE)
+colnames(journals) <- "abbreviated_title"
+
+#group and summarise
+journals.g <- group_by(journals, abbreviated_title)
+journals.s <- dplyr::summarise(journals.g, count = n())
+colnames(journals.s) <- c("Abbreviated Title", "Number of Articles")
+
+#order journals by number of articles
+journals.ordered <- journals.s[order(-journals.s$`Number of Articles`),]
+
+#get all countries of the journal
+countries <- as.data.frame(xpathSApply(castleman,                                      "//PubmedArticle/MedlineCitation/MedlineJournalInfo/Country",xmlValue), stringsAsFactors = FALSE)
+colnames(countries) <- "country"
+
+#unify names to map_world names
+countries <- countries %>% mutate(country = if_else(country == "United States", 'USA', 
+ if_else(country == "United Kingdom", 'UK',
+ if_else(country == "China (Republic : 1949- )", "China",
+ if_else(country == "England", "UK",
+ if_else(country == "Korea (South)", "South Korea",
+ if_else(country == "Northern Ireland", "UK",
+ if_else(country == "Russia (Federation)", "Russia",
+ if_else(country == "Scotland", "UK",
+ country)))))))))
+
+#group and summarise
+countries.g <- group_by(countries, country)
+countries.s <- dplyr::summarise(countries.g, count = n())
+colnames(countries.s) <- c("Country of Publication", "Number of Articles")
+
+#order journals by number of articles
+countries.ordered <- countries.s[order(-countries.s$`Number of Articles`),]
+
+```
+
+_**Which journals are publishing on Castleman Disease?**_
+
+We can use the MEDLINE data to identify the journals that are publishing on Castleman Disease. There are `r nrow(journals.s)` different journals publishing on Castleman Disease. The top 25 journals, by number of articles published on Castleman Disease, are shown below:
+
+`r head(journals.ordered, 25)`
+
+These journals are from `r nrow(countries.s)` different countries. The top 25 countires, by number of articles published on Castleman Disease, are shown below:
+
+`r head(countries.ordered, 25)`
+
+We can also view the countries of publication on a world map:
+
+```{r worldmap, warning=FALSE, message=FALSE}
+#using ggplot and map_data
+#code modified from brennonborbon (2017)
+
+#get map data
+map.world <- map_data('world') 
+
+#join journal countires with world map data
+d <- left_join(map.world, countries.s, by = c('region' = 'Country of Publication'))
+
+#plot it
+p2 <- ggplot(data = d, aes(x = long, y = lat, group = group)) +
+ geom_polygon(aes(fill = `Number of Articles`)) + 
+scale_fill_viridis(option = 'plasma')+ 
+labs(title = "Country of Publication", subtitle = "Number of Articles on Castleman Disease", caption = "Source: MEDLINE/Pubmed") + 
+theme_bw()
+
+p2
+```
+
+##Who is Doing the Research? 
+###Authors
+```{r authors, eval=TRUE}
+
+#function to put specific XML elements into dataframe with PMID
+author_df <- function(pmid.value){
+  PMID <- xpathSApply(castleman, paste('//PubmedArticle/MedlineCitation[PMID=',pmid.value,']/PMID'), xmlValue)
+  
+  if(length(xpathSApply(castleman, paste('//PubmedArticle/MedlineCitation[PMID=',pmid.value,']/Article/AuthorList/Author'), xmlValue)) > 0){
+    author <- xpathSApply(castleman, paste('//PubmedArticle/MedlineCitation[PMID=',pmid.value,']/Article/AuthorList/Author'), xmlValue)
+  }else{
+    author <- 'no author provided'
+  }
+  as.data.frame(cbind(PMID=PMID, author=author))
+} 
+
+#loop through this function with a list of PMIDs
+data.list <- lapply(pmid_list, author_df)
+authors <- as.data.frame(do.call("rbind", data.list), stringsAsFactors = FALSE)
+
+author.g <- group_by(authors, author)
+author.s <- dplyr::summarise(author.g, count = n())
+author.o <- author.s[order(-author.s$count),]
+```
+
+_**Who is publishing on Castleman Disease?**_
+
+There are `r nrow(author.s)` people publishing on Castleman Disease. The top 25 authors, by number of articles published on Castleman Disease, are shown below:
+
+`r head(author.o, 25)`
+
+The difficulty here is one of disambiguation. In this list, the author affiliation is concatenated with the author name and our data may be too granular (people change affiliations or no affiliation is reported in MEDLINE for a specific article).
+
+```{r author_alt, warning=FALSE, message=FALSE}
+author_df2 <- function(pmid.value){
+  PMID <- pmid.value
+  
+  if(length(xpathSApply(castleman, paste('//PubmedArticle/MedlineCitation[PMID=',pmid.value,']/Article/AuthorList/Author/LastName'), xmlValue)) > 0){
+    lastName <- xpathSApply(castleman, paste('//PubmedArticle/MedlineCitation[PMID=',pmid.value,']/Article/AuthorList/Author/LastName'), xmlValue)
+  }else{
+    lastName <- 'no name provided'
+  }
+  
+  if(length(xpathSApply(castleman, paste('//PubmedArticle/MedlineCitation[PMID=',pmid.value,']/Article/AuthorList/Author/Initials'), xmlValue)) > 0){
+    initials <- xpathSApply(castleman, paste('//PubmedArticle/MedlineCitation[PMID=',pmid.value,']/Article/AuthorList/Author/Initials'), xmlValue)
+  }else{
+    initials <- 'no name provided'
+  }
+  
+  if(length(xpathSApply(castleman, paste('//PubmedArticle/MedlineCitation[PMID=',pmid.value,']/Article/AuthorList/Author/ForeName'), xmlValue)) > 0){
+    foreName <- xpathSApply(castleman, paste('//PubmedArticle/MedlineCitation[PMID=',pmid.value,']/Article/AuthorList/Author/ForeName'), xmlValue)
+  }else{
+    foreName <- 'no name provided'
+  }
+  
+  
+  as.data.frame(cbind(PMID=PMID, lastName=lastName, foreName=foreName, initials=initials))
+} 
+
+
+#loop through this function with a list of PMIDs
+data.list <- lapply(pmid_list, author_df2)
+authors2 <- as.data.frame(do.call("rbind", data.list), stringsAsFactors = FALSE)
+authors2$concatName <- paste(authors2$foreName,
+                              authors2$initials,
+                              authors2$lastName,
+                              sep = " ")
+
+author.g2 <- group_by(authors2, concatName)
+author.s2 <- dplyr::summarise(author.g2, count = n())
+author.o2 <- author.s2[order(-author.s2$count),]
+
+```
+
+We can try again by stripping out affiliation and only using the concatenation of first name, initials, last name as the representation of a unique author.
+
+`r head(author.o2, 25)`
+
+###Who is publishing with whom?
+
+_**Which authors publish together?**_
+```{r author_pairings}
+topAuthors2 <- subset(authors2, authors2$concatName %in% author.o2[1:25,]$concatName)
+
+simpleNetwork(topAuthors2, zoom = TRUE, opacity = 1)
+
+```
+
+
+###Affiliations
+```{r affiliations, eval=TRUE}
+#function to put specific elements into dataframe with PMID
+affiliation_df <- function(pmid.value){
+  PMID <- xpathSApply(castleman, paste('//PubmedArticle/MedlineCitation[PMID=',pmid.value,']/PMID'), xmlValue)
+  
+  if(length(xpathSApply(castleman, paste('//PubmedArticle/MedlineCitation[PMID=',pmid.value,']/Article/AuthorList/Author/AffiliationInfo/Affiliation'), xmlValue)) > 0){
+    affiliation <- xpathSApply(castleman, paste('//PubmedArticle/MedlineCitation[PMID=',pmid.value,']/Article/AuthorList/Author/AffiliationInfo/Affiliation'), xmlValue)
+  }else{
+    affiliation <- 'no affiliation provided'
+  }
+  as.data.frame(cbind(PMID=PMID, affiliation=affiliation))
+} 
+
+#loop through this function with a list of PMIDs
+data.list <- lapply(pmid_list, affiliation_df)
+affiliations <- as.data.frame(do.call("rbind", data.list), stringsAsFactors = FALSE)
+
+affiliation.g <- group_by(affiliations, affiliation)
+affiliation.s <- dplyr::summarise(affiliation.g, count = n())
+affiliation.o <- affiliation.s[order(-affiliation.s$count),]
+#head(affiliation.o, 10)
+
+```
+
+_**What is the institution affiliation of authors?**_
+
+There are `r nrow(affiliation.s)` institutions publishing on Castleman Disease. The top 25 instituions, by number of articles published on Castleman Disease, are shown below:
+
+`r head(affiliation.o, 25)`
+
+```{r aff_pairings}
+topAffiliations <- subset(affiliations, affiliations$affiliation %in% affiliation.o[2:101,]$affiliation)
+
+simpleNetwork(topAffiliations, zoom = TRUE, opacity = 1)
+```
+
+##What Research is Getting Funded?
+```{r grants}
+#get all grant agencies
+agencies <- as.data.frame(xpathSApply(castleman,                                      "//PubmedArticle/MedlineCitation/Article/GrantList/Grant/Agency", xmlValue), stringsAsFactors = FALSE)
+colnames(agencies) <- "agency"
+
+#group and summarise
+agencies.g <- group_by(agencies, agency)
+agencies.s <- dplyr::summarise(agencies.g, count = n())
+
+#top 10 agencies funding research (by count, not $$$)
+agencies.o <- agencies.s[order(-agencies.s$count),]
+
+#get all countries of the granting agencies
+countries.ag <- as.data.frame(xpathSApply(castleman,                                      "//PubmedArticle/MedlineCitation/Article/GrantList/Grant/Country",xmlValue), stringsAsFactors = FALSE)
+colnames(countries.ag) <- "country"
+
+#group and summarise
+countriesag.g <- group_by(countries.ag, country)
+countriesag.s <- dplyr::summarise(countriesag.g, count = n())
+
+#top 10 countries of publication
+countriesag.o <- countriesag.s[order(-countriesag.s$count),]
+#head(countriesag.ordered[1:10,])
+
+```
+
+There are `r nrow(agencies.s)` difference agencies funding research on Castleman Disease. The top 25 agencies, by number of articles funded on Castleman Disease, are shown below:
+
+`r head(agencies.o, 25)`
+
+These agencies are from `r nrow(countriesag.s)` different countries. The top 5 countries, by number of articles funded on Castleman Disease, are shown below:
+
+`r head(countriesag.o, 5)`
+
+#Open Access Licenses
+```{r OA, , eval=FALSE}
+#this code chunk was run once to pull OA data from CrossRef APIs
+
+#Get DOI for each article
+dois <- as.data.frame(xpathSApply(castleman, '//PubmedArticle/PubmedData/ArticleIdList/ArticleId[@IdType="doi"]', xmlValue), stringsAsFactors = FALSE)
+colnames(dois) <- "doi"
+
+#remove malformed dois
+dois <- subset(dois, dois$doi != "/S0716-10182011000100015")
+dois <- subset(dois, dois$doi != "1.2006/JCPSP.7475")
+
+#Function to call CrossRef and oaDOI APIs -----
+
+getOA <- function(x){
+  #build CrossRef API URL from function input
+  cr.url <- paste("https://api.crossref.org/works?filter=doi:", x, sep = "")
+  
+  #get CrossRef work data
+  cr <- fromJSON(file = cr.url)
+  
+  #extract license data
+  
+  if(length(cr[["message"]] [["items"]]) >0){
+      
+      cr.url <- ifelse(length(cr[["message"]] [["items"]] [[1]] [["license"]]) >0,
+                       cr[["message"]] [["items"]] [[1]] [["license"]] [[1]] [["URL"]],
+                       "No license information provided")
+      cr.urlalt <- ifelse(length(cr[["message"]] [["items"]] [[1]] [["license"]]) >1,
+                          cr[["message"]] [["items"]] [[1]] [["license"]] [[2]] [["URL"]],
+                          "No alternative URL provided")
+      
+    } else {
+      #build variables for non-existent DOIs
+      cr.url <- "Data not found"
+      cr.urlalt <- "Data not found"
+      
+    }  
+  
+  
+  #put the information together
+  data.final <- as.data.frame(cbind(x, cr.url, cr.urlalt))
+  
+  data.final
+}
+
+#create list of DOIs to query ----
+temp <- dois[751:1153,]
+mylist <- as.list(temp)
+
+#apply function to list; assemble into dataframe
+Sys.time()
+data.list <- lapply(mylist, getOA)
+final <- as.data.frame(do.call("rbind", data.list), stringsAsFactors = FALSE)
+Sys.time()
+
+oa.1153 <- final
+oa.500 <- read_csv("oa_1_500.csv", col_names = TRUE)
+oa.500 <- oa.500[,-1]
+
+oa.all <- rbind(oa.500, oa.750, oa.1153)
+
+#the above function was used to call the CrossRef API to get OA license information. After doing this once, the results were saved to a .CSV file that could be loaded at later times to save time
+write.csv(oa.all, "oa_All.csv")
+
+oa.All.g <- group_by(oa.all, cr.url)
+oa.All.s <- dplyr::summarise(oa.All.g, count = n())
+
+#top 10 licenses attributed to publications
+oa.All.o <- oa.All.s[order(-oa.All.s$count),]
+
+```
+
+```{r OA_from_file}
+#this code uses the results of the OA function saved to a csv file
+oa.all <- read_csv("oa_All.csv", col_names = TRUE)
+oa.all <- oa.all[,-1]
+oa.All.g <- group_by(oa.all, cr.url)
+oa.All.s <- dplyr::summarise(oa.All.g, count = n())
+
+#top licenses attributed to publications
+oa.All.o <- oa.All.s[order(-oa.All.s$count),]
+
+```
+
+There are `r nrow(oa.All.s)` different licenses attributed to Castleman Disease articles. The top licenses, by number of articles, are shown below:
+
+`r oa.All.o`
+
+#Exploring Relationships in the Literature
+##Most-Cited Articles
+```{r citations, eval=TRUE}
+#function to get PMID and cited PMID
+citation_df <- function(pmid.value){
+  #get main PMID
+  PMID <- xpathSApply(castleman, paste('//PubmedArticle/MedlineCitation[PMID=',pmid.value,']/PMID'), xmlValue)
+  
+  #get referenceIDs
+  if(length(xpathSApply(castleman, paste('//PubmedArticle[MedlineCitation/PMID=',pmid.value,']/PubmedData/ReferenceList/Reference/ArticleIdList/ArticleId[@IdType="pubmed"]'), xmlValue)) > 0){
+    referenceID <- xpathSApply(castleman, paste('//PubmedArticle[MedlineCitation/PMID=',pmid.value,']/PubmedData/ReferenceList/Reference/ArticleIdList/ArticleId[@IdType="pubmed"]'), xmlValue)
+  } else {
+    referenceID <- 'no cited reference'
+  }
+  #put together into a dataframe
+  as.data.frame(cbind(PMID=PMID, referenceID=referenceID))
+}
+
+#apply function to list
+data.list <- lapply(pmid_list, citation_df)
+final <- as.data.frame(do.call("rbind", Filter(function(x) length(x)==2, data.list)), stringsAsFactors = FALSE)
+
+#drop no cited reference
+final.final <- subset(final, final$referenceID != "no cited reference")
+final.final$PMID <- as.character(final.final$PMID)
+final.final$referenceID <- as.character(final.final$referenceID)
+
+#identify most cited PMIDs
+final.g <- group_by(final.final, referenceID)
+final.s <- dplyr::summarise(final.g, count=n())
+final.o <- final.s[order(final.s$count, decreasing = TRUE),]
+top5 <- as.character(as.list(final.o[1:5,]$referenceID))
+top10 <- as.character(as.list(final.o[1:10,]$referenceID))
+top25 <- as.character(as.list(final.o[1:25,]$referenceID))
+
+top5.cited <- subset(final.final, final.final$referenceID %in% top5)
+top10.cited <- subset(final.final, final.final$referenceID %in% top10)
+
+k=25
+inCorpus = matrix(0, nrow = k, ncol = 1, byrow = TRUE)
+for (i in 1:k){
+inCorpus[i,1] = top25[[i]] %in% pmid_list
+}
+
+k=nrow(final.s)
+inCorpusAll = matrix(0, nrow = k, ncol = 1, byrow = TRUE)
+for (i in 1:k){
+inCorpusAll[i,1] = final.s[i,]$referenceID %in% pmid_list
+}
+
+```
+
+_**What are the most influential articles for Castleman Disease?**_
+
+The top cited articles are:
+
+`r top25`
+
+The number of most influential articles not in the core corpus is `r 25 - sum(inCorpus)`
+
+The core corpus cites `r nrow(final.s) - sum(inCorpusAll)` articles outside the core corpus.
+
+
+##Citation Graph
+```{r citation_graph}
+
+g5 <- graph_from_data_frame(top5.cited, directed=FALSE)
+plot(g5,
+     vertex.label=NA)
+```
+
+_**When were the most cited publications published?**_
+```{r citation_graphs, , eval=TRUE}
+
+#plot the publication year of the most cited research
+pubdates.df <- function(pmid.value){
+  #get main PMID
+  PMID <- xpathSApply(castleman, paste('//PubmedArticle/MedlineCitation[PMID=',pmid.value,']/PMID'), xmlValue)
+  
+  pubdate <- xpathSApply(castleman, paste('//PubmedArticle[MedlineCitation/PMID=',pmid.value,']/MedlineCitation/Article/Journal/JournalIssue/PubDate/Year'), xmlValue)
+  
+  as.data.frame(cbind(PMID=PMID, pubdate=pubdate))
+}
+
+top100 <- as.character(as.list(final.o[1:100,]$referenceID))
+data.list2 <- lapply(top100, pubdates.df)
+dates <- as.data.frame(do.call("rbind", Filter(function(x) length(x)==2, data.list2)), stringsAsFactors = FALSE)
+dates.g <- group_by(dates, pubdate)
+dates.s <- dplyr::summarise(dates.g, count=n())
+dates.s$pubdate <- as.Date(dates.s$pubdate, format = "%Y")
+
+p1 <- ggplot(data=dates.s, aes(x=pubdate, y=count)) +
+  geom_bar(stat="identity", fill="dark red") + 
+  labs(title="Number of Publications by Year")
+p1
+
+```
+
+
+#Topics and Concepts
+
+##Unsupervised learning of topics
+```{r lda, , eval=TRUE}
+#get our abstract
+abstract_all <- as.data.frame(xpathSApply(castleman, "//Abstract", xmlValue), stringsAsFactors = FALSE)
+colnames(abstract_all) <- "abstract"
+abstract_all <- subset(abstract_all, abstract_all$abstract != "") #remove blank abstracts
+
+#create a corpus
+source <- VectorSource(abstract_all$abstract)
+corpus <- Corpus(source)
+
+#clean up the corpus
+corpus <- tm_map(corpus, content_transformer(tolower))
+#corpus <- tm_map(corpus, removeNumbers) #choosing not to do this in order to preserve numbers in chemical names
+corpus <- tm_map(corpus, removePunctuation)
+corpus <- tm_map(corpus, stripWhitespace)
+corpus <- tm_map(corpus, removeWords, stopwords('english'))
+
+#create document-term matrix
+DTM <- DocumentTermMatrix(corpus)
+
+#remove infrequent words
+freq_words <- findFreqTerms(DTM, 5)
+DTM <- DTM[,freq_words]
+
+#create unique indexes; this step prevents us from getting errors
+unique_indexes <- unique(DTM$i) 
+DTM <- DTM[unique_indexes,]
+
+```
+
+#Finding optimal topics
+```{r topic_numbers, eval=TRUE, message=FALSE}
+#LDA tuning, Gibbs method
+Sys.time()
+result.g <- FindTopicsNumber(
+  DTM,
+  topics = seq(from = 10, to = 100, by = 10),
+  metrics = c("Griffiths2004", "CaoJuan2009", "Arun2010", "Deveaud2014"),
+  method = "Gibbs",
+  control = list(burnin = 1000, iter = 1000, keep = 50),
+  mc.cores = 3L, #change this to match the cores on your machine
+  verbose = TRUE
+)
+FindTopicsNumber_plot(result.g)
+Sys.time()
+```
+
+
+#topic modeling
+```{r lda, message=FALSE, warning=FALSE}
+
+##execute topic modeling via Latent Dirichlet Allocation with the Gibbs method
+Sys.time()
+lda <- LDA(DTM, k = 45, method = "Gibbs", control = list(burnin = 1000, iter = 1000, keep = 50))
+Sys.time()
+topics <- terms(lda)
+topics #display topics
+
+#word-topic probabilities
+#this calculates the probability that a specific word came from a specific topic
+abstract.topics <- tidy(lda, matrix = "beta")
+
+#filter for top 10 terms per topic
+abstract.topterm <- abstract.topics %>%
+  group_by(topic) %>%
+  top_n(15, beta) %>%
+  ungroup() %>%
+  arrange(topic, -beta)
+
+#plot it
+topics.labels <- as.vector(topics) #convert topic to vector
+
+topicplot <- function(x) {
+  abstract.topterm[abstract.topterm$topic == x,] %>%
+  mutate(term = reorder(term, beta)) %>%
+  ggplot(aes(term, beta)) +
+  geom_col(show.legend = FALSE, fill = "#424777") +
+  labs(title = topics.labels[x], subtitle = paste("Topic ", x)) +
+  coord_flip()
+}
+
+plotnumber <- c(1:10)
+lapply(plotnumber, topicplot)
+
+```
+
+The topics discussed in this corpus of ariticles are:
+
+`r topics`
+
+#Text Summarization
+
+```{r summarization}
+#uses 'textmineR' library
+
+#get PMID and abstracts
+abstracts_df <- function(pmid.value){
+  #get main article PMID
+  PMID <- xpathSApply(castleman, paste('//PubmedArticle/MedlineCitation[PMID=',pmid.value,']/PMID'), xmlValue)
+  
+  #get abstract if present
+  if(length(xpathSApply(castleman, paste('//PubmedArticle/MedlineCitation[PMID=',pmid.value,']/Article/Abstract'), xmlValue)) > 0){
+    abstract <- xpathSApply(castleman, paste('//PubmedArticle/MedlineCitation[PMID=',pmid.value,']/Article/Abstract'), xmlValue)
+  }else{
+    abstract <- 'no abstract provided'
+  }
+  as.data.frame(cbind(PMID=PMID, abstract=abstract))
+} 
+
+#loop through this function with a list of PMIDs
+data.list <- lapply(pmid_list, abstracts_df)
+final.abs <- as.data.frame(do.call("rbind", data.list), stringsAsFactors = FALSE)
+
+#drop blank abstracts
+abstracts <- subset(final.abs, !(final.abs$abstract == "") & !(final.abs$abstract == "no abstract provided"))
+
+###code modified from Jones (Document Summarization, 2019) ###
+
+#create a TCM using skim grams with 5-word window
+tcm <- CreateTcm(doc_vec = abstracts$abstract,
+                 skipgram_window = 10,
+                 verbose = FALSE,
+                 cpus = 3)
+
+#use LDA to get embeddings into probability space
+embeddings <- FitLdaModel(dtm = tcm,
+                          k = 50,
+                          iterations = 200,
+                          burnin = 180,
+                          alpha = 0.1,
+                          beta = 0.05,
+                          optimize_alpha = TRUE,
+                          calc_likelihood = FALSE,
+                          calc_coherence = TRUE,
+                          calc_r2 = TRUE)
+
+#time for summarization
+summarizer <- function(doc, gamma) {
+  
+  # recurse through multiple documents
+  if (length(doc) > 1 )
+    # use a try statement to catch errors
+    return(sapply(doc, function(d) try(summarizer(d, gamma))))
+  
+  # parse it into sentences
+  sent <- stringi::stri_split_boundaries(doc, type = "sentence")[[ 1 ]]
+  
+  names(sent) <- seq_along(sent) # so we know index and order
+  
+  # embed the sentences in the model
+  e <- CreateDtm(sent, ngram_window = c(1,1), verbose = FALSE, cpus = 2)
+  
+  # remove any documents with 2 or fewer words
+  e <- e[ rowSums(e) > 2 , ]
+  
+  vocab <- intersect(colnames(e), colnames(gamma))
+  
+  e <- e / rowSums(e)
+  
+  e <- e[ , vocab ] %*% t(gamma[ , vocab ])
+  
+  e <- as.matrix(e)
+  
+  # get the pairwise distances between each embedded sentence
+  e_dist <- CalcHellingerDist(e)
+  
+  # turn into a similarity matrix
+  g <- (1 - e_dist) * 100
+  
+  # we don't need sentences connected to themselves
+  diag(g) <- 0
+  
+  # turn into a nearest-neighbor graph
+  g <- apply(g, 1, function(x){
+    x[ x < sort(x, decreasing = TRUE)[ 3 ] ] <- 0
+    x
+  })
+  
+  # by taking pointwise max, we'll make the matrix symmetric again
+  g <- pmax(g, t(g))
+  
+  g <- graph.adjacency(g, mode = "undirected", weighted = TRUE)
+  
+  # calculate eigenvector centrality
+  ev <- evcent(g)
+  
+  # format the result
+  result <- sent[ names(ev$vector)[ order(ev$vector, decreasing = TRUE)[ 1:2 ] ] ]
+  
+  result <- result[ order(as.numeric(names(result))) ]
+  
+  paste(result, collapse = " ")
+}
+
+#get summaries for select abstracts
+docs <- abstracts$abstract[10:15] #selecting arbitrary abstracts to summarize
+names(docs) <- abstracts$PMID[10:15]
+
+sums <- summarizer(docs, gamma = embeddings$gamma)
+
+topDocs2 <- subset(abstracts, abstracts$PMID == "2788466")
+docs2 <- topDocs2$abstract
+sums2 <- summarizer(docs2, gamma = embeddings$gamma)
+
+topDocs3 <- subset(abstracts, abstracts$PMID == "7632932")
+docs3 <- topDocs3$abstract
+sums3 <- summarizer(docs3, gamma = embeddings$gamma)
+
+topDocs4 <- subset(abstracts, abstracts$PMID == "15998837")
+docs4 <- topDocs4$abstract
+sums4 <- summarizer(docs4, gamma = embeddings$gamma)
+
+```
+
+`r sums2`
+
+`r sums3`
+
+`r sums4`
+
+
+#Document Clustering
+```{r clusters, warning=FALSE}
+#Code modified from Jones (Document Clustering, 2019)
+
+# create a document term matrix 
+dtm <- CreateDtm(doc_vec = abstracts$abstract,
+                 doc_names = abstracts$PMID, 
+                 ngram_window = c(1, 2), # minimum and maximum n-gram length
+                 stopword_vec = c(stopwords::stopwords("en"), 
+                                  stopwords::stopwords(source = "smart")), 
+                 lower = TRUE, 
+                 remove_punctuation = TRUE, 
+                 remove_numbers = FALSE, #remaining consistent with choice made in LDA
+                 verbose = FALSE,
+                 cpus = 3) 
+
+# construct the matrix of term counts to get the IDF vector
+tf_mat <- TermDocFreq(dtm)
+
+# TF-IDF and cosine similarity
+tfidf <- t(dtm[ , tf_mat$term ]) * tf_mat$idf
+
+tfidf <- t(tfidf)
+
+csim <- tfidf / sqrt(rowSums(tfidf * tfidf))
+
+csim <- csim %*% t(csim)
+
+cdist <- as.dist(1 - csim)
+
+#cluster the documents
+hc <- hclust(cdist, "ward.D")
+
+clustering <- cutree(hc, 15)
+
+plot(hc, main = "Hierarchical clustering of abstracts on Castleman Disease",
+     ylab = "", xlab = "", yaxt = "n")
+rect.hclust(hc, 15, border = "red")
+
+
+#What's in it?
+p_words <- colSums(dtm) / sum(dtm)
+
+cluster_words <- lapply(unique(clustering), function(x){
+  rows <- dtm[ clustering == x , ]
+  
+  # Drop all words that don't appear in the cluster
+  rows <- rows[ , colSums(rows) > 0 ]
+  
+  colSums(rows) / sum(rows) - p_words[ colnames(rows) ]
+})
+
+# create a summary table of the top 5 words defining each cluster
+cluster_summary <- data.frame(cluster = unique(clustering),
+                              size = as.numeric(table(clustering)),
+                              top_words = sapply(cluster_words, function(d){
+                                paste(
+                                  names(d)[ order(d, decreasing = TRUE) ][ 1:5 ], 
+                                  collapse = ", ")
+                              }),
+                              stringsAsFactors = FALSE)
+
+cluster_summary
+
+# plot a word cloud of one cluster as an example
+wordcloud::wordcloud(words = names(cluster_words[[ 7 ]]), 
+                     freq = cluster_words[[ 7 ]], 
+                     max.words = 50, 
+                     random.order = FALSE, 
+                     colors = c("grey", "dark blue", "dark red"),
+                     main = "Top words in cluster 100")
+
+```
+
+```{r dunn_index}
+#finding optimal number for k
+#Code modified from Gyrgorian (2017)
+
+# Finding the optimal number of clusters using Dunn Index
+k = 50
+mat = matrix(0, nrow = k, ncol = 2, byrow = TRUE)
+for (i in 1:k) {
+  members = cutree(hc, i)
+  dunn_index = dunn(clusters = members, Data = cdist)
+  mat[i,1] = i
+  mat[i,2] = dunn_index
+}
+
+# Plot number of clusters vs Dunn Index
+plot(mat, 
+     type = 'b',
+     xlab = "Number of Cluster", 
+     ylab = "Dunn Index",
+     pch = 16,
+     col = "red",
+     main = "Dunn's Index vs Number of clusters",
+     col.main = "dodgerblue")
+points(mat, col = "green")
+```
+
+
+## LDA and LSA
+```{r lda_lsa}
+#using the dtm created above
+#code modified from Jones (Topic Modeling, 2019)
+
+set.seed(12345)
+
+model <- FitLdaModel(dtm = dtm, 
+                     k = 45,
+                     iterations = 500, 
+                     burnin = 180,
+                     alpha = 0.1,
+                     beta = 0.05,
+                     optimize_alpha = TRUE,
+                     calc_likelihood = TRUE,
+                     calc_coherence = TRUE,
+                     calc_r2 = TRUE,
+                     cpus = 3)
+
+str(model)
+model$r2
+plot(model$log_likelihood, type = "l")
+summary(model$coherence)
+hist(model$coherence, 
+     col= "blue", 
+     main = "Histogram of probabilistic coherence")
+model$top_terms <- GetTopTerms(phi = model$phi, M = 5)
+head(t(model$top_terms))
+model$prevalence <- colSums(model$theta) / sum(model$theta) * 100     
+plot(model$prevalence, model$alpha, xlab = "prevalence", ylab = "alpha")
+model$labels <- LabelTopics(assignments = model$theta > 0.05, 
+                            dtm = dtm,
+                            M = 1)
+
+head(model$labels)
+#model$summary[ order(model$summary$prevalence, decreasing = TRUE) , ][ 1:10 , ]
+assignments <- predict(model, dtm,
+                       method = "gibbs", 
+                       iterations = 200,
+                       burnin = 180,
+                       cpus = 2)
+assignments_dot <- predict(model, dtm,
+                           method = "dot")
+barplot(rbind(assignments[10,], assignments_dot[10,]),
+        col = c("red", "blue"), las = 2, beside = TRUE)
+legend("topright", legend = c("gibbs", "dot"), col = c("red", "blue"), 
+       fill = c("red", "blue"))
+
+
+#LSA
+tf_sample <- TermDocFreq(dtm)
+
+tf_sample$idf[ is.infinite(tf_sample$idf) ] <- 0 # fix idf for missing words
+
+tf_idf <- t(dtm / rowSums(dtm)) * tf_sample$idf
+
+tf_idf <- t(tf_idf)
+
+lsa_model <- FitLsaModel(dtm = tf_idf, 
+                     k = 45)
+
+str(lsa_model)
+
+summary(lsa_model$coherence)
+
+hist(lsa_model$coherence, col= "blue")
+
+lsa_model$top_terms <- GetTopTerms(phi = lsa_model$phi, M = 5)
+
+head(t(lsa_model$top_terms))
+
+lsa_model$prevalence <- colSums(lsa_model$theta) / sum(lsa_model$theta) * 100
+
+lsa_model$labels <- LabelTopics(assignments = lsa_model$theta > 0.05, 
+                            dtm = dtm,
+                            M = 1)
+
+head(lsa_model$labels)
+
+lsa_model$summary <- data.frame(topic = rownames(lsa_model$phi),
+                            label = lsa_model$labels,
+                            coherence = round(lsa_model$coherence, 3),
+                            prevalence = round(lsa_model$prevalence,3),
+                            top_terms = apply(lsa_model$top_terms, 2, function(x){
+                              paste(x, collapse = ", ")
+                            }),
+                            stringsAsFactors = FALSE)
+
+Sys.time()
+```
+
+
+#References
+
+brennonborbon. (2017, December 16). *Creating simple world maps in ggplot2 for beginners.* Retrieved from https://brennonborbon.wordpress.com/2017/12/16/creating-simple-world-maps-in-ggplot2/
+
+Gyrgorian, A. (2017, April 24). *Text mining. Clustering analysis*. Retrieved from https://rstudio-pubs-static.s3.amazonaws.com/271085_3772c982c5664206aab04b842a04a761.html
+
+Jones, T. (2019, March 21). *5. Document summarization*. Retrieved from https://cran.r-project.org/web/packages/textmineR/vignettes/e_doc_summarization.html 
+
+Jones, T. (2019, March 21). *6. Document clustering*. Retrieved from https://cran.r-project.org/web/packages/textmineR/vignettes/b_document_clustering.html
+
+Jones, T. (2019, March 21). *3. Topic modeling*. Retrieved from https://cran.r-project.org/web/packages/textmineR/vignettes/c_topic_modeling.html
+
+Henry, S., & McInnes, B. (2017). Literature based discovery: models, methods, and trends. *Journal of Biomedical Informatics*, 74 (20-32). doi: 10.1016/j.jbi.2017.08.011
